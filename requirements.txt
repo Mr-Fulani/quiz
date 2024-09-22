@@ -1,0 +1,7 @@
+aiogram~=3.13.1
+SQLAlchemy~=2.0.35
+boto3~=1.35.24
+pillow~=10.4.0
+Pygments~=2.18.0
+python-dotenv~=1.0.1
+alembic~=1.13.2
