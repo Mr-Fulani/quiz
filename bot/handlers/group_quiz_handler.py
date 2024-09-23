@@ -13,6 +13,9 @@ from bot.keyboards.inline import get_task_or_json_keyboard
 group_quiz_router = Router()
 
 
+
+
+
 @group_quiz_router.callback_query(lambda query: query.data == "confirm_launch_group")
 async def create_quiz_for_group(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
     """
@@ -88,7 +91,8 @@ async def create_quiz_for_group(callback: types.CallbackQuery, state: FSMContext
             wrong_answers=",".join([a for a in data['answers'] if a != data['correct_answer']]),
             explanation=data['explanation'],
             resource_link=data['resource_link'],
-            image_url=image_url
+            image_url=image_url,
+            short_description=data.get('short_description')  # Теперь это поле необязательное
         )
         session.add(new_task)
         await session.commit()
