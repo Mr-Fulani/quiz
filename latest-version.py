@@ -1,7 +1,11 @@
+import io
+import json
 import os
 import logging
+
+
 from PIL import Image
-from aiogram import Router, types
+from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -61,19 +65,39 @@ async def process_subtopic(message: types.Message, state: FSMContext):
     await state.update_data(subtopic=subtopic)
 
     # Переход к следующему этапу: ввод краткого описания
-    await message.answer("Введите краткое описание задачи.")
+    await message.answer("Введите краткое описание задачи или введите '0' для пропуска.")
     await state.set_state(QuizStates.waiting_for_short_description)
+
+
+
 
 
 @quiz_router.message(QuizStates.waiting_for_short_description)
 async def process_short_description(message: types.Message, state: FSMContext):
     """
-    Обработчик ввода краткого описания задачи.
+    Обработчик ввода краткого описания задачи. Поле необязательно, можно пропустить.
     """
     short_description = message.text.strip()
+
+    # Если пользователь решил пропустить описание
+    if short_description == '0':
+        short_description = None
+        await state.update_data(short_description=short_description)
+        await message.answer("Описание пропущено. Введите текст задачки (например, отрывок кода).")
+        logging.info("Пользователь пропустил ввод краткого описания.")
+    else:
+        await state.update_data(short_description=short_description)
+        await message.answer("Описание добавлено. Введите текст задачки (например, отрывок кода).")
+        logging.info(f"Краткое описание добавлено: {short_description}")
+
+
+    # Обновляем состояние FSM
     await state.update_data(short_description=short_description)
-    await message.answer("Краткое описание сохранено. Введите текст задачки (например, отрывок кода).")
     await state.set_state(QuizStates.waiting_for_question)
+
+
+
+
 
 
 @quiz_router.message(QuizStates.waiting_for_question)
@@ -107,6 +131,8 @@ async def process_question(message: types.Message, state: FSMContext):
     await state.set_state(QuizStates.waiting_for_answers)
 
 
+
+
 @quiz_router.message(QuizStates.waiting_for_answers)
 async def process_answers(message: types.Message, state: FSMContext):
     """
@@ -123,6 +149,8 @@ async def process_answers(message: types.Message, state: FSMContext):
     await state.update_data(answers=answers)
     await message.answer("Варианты ответа сохранены. Укажите правильный ответ.")
     await state.set_state(QuizStates.waiting_for_correct_answer)
+
+
 
 
 @quiz_router.message(QuizStates.waiting_for_correct_answer)
@@ -142,6 +170,8 @@ async def process_correct_answer(message: types.Message, state: FSMContext):
     await state.set_state(QuizStates.waiting_for_explanation)
 
 
+
+
 @quiz_router.message(QuizStates.waiting_for_explanation)
 async def process_explanation(message: types.Message, state: FSMContext):
     """
@@ -151,6 +181,9 @@ async def process_explanation(message: types.Message, state: FSMContext):
     await state.update_data(explanation=explanation)
     await message.answer("Пояснение сохранено. Введите ссылку на дополнительный ресурс.")
     await state.set_state(QuizStates.waiting_for_resource_link)
+
+
+
 
 
 @quiz_router.message(QuizStates.waiting_for_resource_link)
@@ -256,7 +289,8 @@ async def confirm_quiz(callback: types.CallbackQuery, state: FSMContext, session
             wrong_answers=",".join([a for a in data['answers'] if a != data['correct_answer']]),
             explanation=data['explanation'],
             resource_link=data['resource_link'],
-            image_url=image_url  # Используем URL изображения
+            image_url=image_url,  # Используем URL изображения
+            short_description=data.get('short_description')  # Сохраняем описание
         )
         session.add(new_task)
         await session.commit()
@@ -291,5 +325,116 @@ async def cancel_quiz(callback: types.CallbackQuery, state: FSMContext):
         logging.info("Временный файл изображения удалён после отмены.")
 
     await callback.message.answer("Викторина отменена. Данные не были сохранены.")
+    await callback.message.edit_reply_markup(reply_markup=get_task_or_json_keyboard())
+    await state.clear()
+
+
+
+
+
+
+@quiz_router.callback_query(lambda query: query.data == "new_task")
+async def start_new_quiz(callback: types.CallbackQuery, state: FSMContext):
+    logging.info("Кнопка 'Новая задача' была нажата.")
+    await callback.message.answer("Выберите тему для новой задачи:", reply_markup=topic_keyboard())
+    await state.set_state(QuizStates.waiting_for_topic)
+
+
+
+
+@quiz_router.callback_query(lambda query: query.data == "upload_json")
+async def upload_tasks_via_json(callback: types.CallbackQuery, state: FSMContext):
+    """
+    Обработчик для загрузки задач из JSON файла.
+    """
+    await callback.message.answer("Пожалуйста, загрузите JSON файл с задачами.")
+    await state.set_state(QuizStates.waiting_for_file)
+    logging.info("Переход в состояние ожидания файла JSON.")
+
+
+
+
+
+
+@quiz_router.message(QuizStates.waiting_for_file, F.document)
+async def process_tasks_file(message: types.Message, state: FSMContext, session: AsyncSession):
+    try:
+        # Получаем объект файла
+        document = message.document
+        file_info = await message.bot.get_file(document.file_id)
+        logging.info(f"File info: {file_info.file_path}")
+
+        # Загружаем файл в буфер
+        file_buffer = io.BytesIO()
+        await message.bot.download_file(file_info.file_path, destination=file_buffer)
+
+        # Возвращаем курсор буфера в начало
+        file_buffer.seek(0)
+
+        # Читаем содержимое как JSON
+        tasks = json.load(file_buffer)
+        logging.info(f"Загружено задач: {len(tasks)}")
+
+        for task in tasks:
+            # Генерация изображения для каждой задачи
+            image = generate_console_image(task['question'], "assets/logo.png")
+            image_name = generate_image_name(task['topic'])
+            image_url = upload_to_s3(image, image_name)
+
+            # Получаем описание задачи, если оно есть
+            short_description = task.get('short_description', None)
+
+            # Сохраняем задачу в базу данных
+            new_task = Task(
+                topic=task['topic'],
+                subtopic=task.get('subtopic', ''),  # Обработайте подтему, если она есть
+                question=task['question'],
+                correct_answer=task['correct_answer'],
+                wrong_answers=",".join([a for a in task['answers'] if a != task['correct_answer']]),
+                explanation=task['explanation'],
+                resource_link=task['resource_link'],
+                image_url=image_url,
+                short_description=short_description  # Сохраняем описание задачи
+            )
+            session.add(new_task)
+
+        # Коммитим транзакцию
+        await session.commit()
+        logging.info(f"Все задачи сохранены в базу данных.")
+        await message.answer(f"Загружено задач: {len(tasks)}")
+
+    except json.JSONDecodeError:
+        await message.answer("Ошибка: Неверный формат файла. Пожалуйста, загрузите корректный JSON-файл.")
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке файла: {e}")
+        await message.answer(f"Ошибка при загрузке файла: {e}")
+
+
+
+
+
+
+
+
+@quiz_router.callback_query(lambda query: query.data == "confirm_launch")
+async def confirm_launch(callback: types.CallbackQuery, state: FSMContext):
+    # Логика запуска викторины
+    await callback.message.answer("Викторина запущена!")
+
+    # Замена кнопок на "Новая задача" и "JSON с задачками"
+    await callback.message.edit_reply_markup(reply_markup=get_task_or_json_keyboard())
+    await state.clear()
+
+
+
+
+
+
+@quiz_router.callback_query(lambda query: query.data == "confirm_cancel")
+async def confirm_cancel(callback: types.CallbackQuery, state: FSMContext):
+    # Логика отмены викторины
+    await callback.message.answer("Викторина отменена.")
+
+    # Замена кнопок на "Новая задача" и "JSON с задачками"
     await callback.message.edit_reply_markup(reply_markup=get_task_or_json_keyboard())
     await state.clear()
