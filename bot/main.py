@@ -1,10 +1,9 @@
 import asyncio
-
 from aiogram import Bot, Dispatcher
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
-
+from bot.handlers.group_quiz_handler import group_publisher_router
 from bot.handlers.quiz import quiz_router
 from bot.keyboards.inline import topic_keyboard
 from bot.middlewares.db_middleware import DbSessionMiddleware
@@ -14,12 +13,12 @@ from config import BOT_TOKEN
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-
 # Регистрация middleware для передачи сессии
 dp.update.middleware(DbSessionMiddleware())
 
 # Регистрация роутеров
 dp.include_router(quiz_router)
+dp.include_router(group_publisher_router)
 
 # Создание нового роутера для команды /start
 start_router = Router()

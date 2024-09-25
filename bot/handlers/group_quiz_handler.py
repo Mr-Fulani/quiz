@@ -1,111 +1,155 @@
-import os
+import asyncio
 import logging
-from PIL import Image
 from aiogram import Router, types
-from aiogram.fsm.context import FSMContext
-from bot.services.image_service import generate_console_image, generate_image_name
-from bot.services.s3_service import upload_to_s3
-from config import GROUP_CHAT_ID
-from database.models import Task
+from aiogram.filters import Command
 from sqlalchemy.ext.asyncio import AsyncSession
-from bot.keyboards.inline import get_task_or_json_keyboard
+from sqlalchemy.future import select
+from database.models import Task
+from config import GROUP_CHAT_ID
 
-group_quiz_router = Router()
+# Создаем роутер
+group_publisher_router = Router()
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Пример лога для теста
+logging.info("Запущена публикация задач в группы.")
 
 
-
-
-
-@group_quiz_router.callback_query(lambda query: query.data == "confirm_launch_group")
-async def create_quiz_for_group(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
+async def fetch_tasks(session: AsyncSession):
     """
-    Обработчик подтверждения создания викторины для группы.
-    Отправляет сообщение с картинкой, темой, подтемой и отдельно опросом.
+    Получает все задачи из базы данных.
     """
-    data = await state.get_data()
+    async with session.begin():
+        result = await session.execute(select(Task))
+        tasks = result.scalars().all()
+        logging.info(f"Найдено задач: {len(tasks)}")  # Лог для проверки количества задач
+        return tasks
 
-    # Генерируем имя для изображения в S3
-    image_name = generate_image_name(data['topic'], data.get('subtopic', ''))
 
-    # Загружаем изображение в S3
+
+async def fetch_task_by_id(session: AsyncSession, task_id: int):
+    """
+    Получает задачу по ID.
+    """
+    async with session.begin():
+        task = await session.get(Task, task_id)
+        if not task:
+            logging.warning(f"Задача с ID {task_id} не найдена.")
+        return task
+
+
+
+async def publish_task(message: types.Message, task: Task):
+    """
+    Публикует одну задачу в группу.
+    """
     try:
-        image_url = upload_to_s3(Image.open(data['temp_image_path']), image_name)
-        logging.info(f"Изображение успешно загружено в S3: {image_url}")
-    except Exception as e:
-        logging.error(f"Ошибка при загрузке изображения в S3: {e}")
-        await callback.message.answer("Ошибка при загрузке изображения.")
-        return
+        # Отправляем картинку с темой и подтемой
+        intro_text = (
+            f"Тема: {task.topic}\n"
+            f"Подтема: {task.subtopic or 'Без подтемы'}"
+        )
+        await message.bot.send_photo(chat_id=GROUP_CHAT_ID, photo=task.image_url, caption=intro_text)
+        logging.info(f"Сообщение с картинкой отправлено: {task.image_url}")
 
-    # Текст для первого сообщения: тема, подтема
-    quiz_intro_text = (
-        f"Тема: {data['topic']}\n"
-        f"Подтема: {data.get('subtopic', 'Без подтемы')}"
-    )
+        # Проверяем и логируем правильные и неправильные ответы
+        wrong_answers = task.wrong_answers
+        if not isinstance(wrong_answers, list):
+            logging.error(f"Ожидался список неправильных ответов, но получено: {type(wrong_answers)}")
+            return
 
-    # Отправляем первое сообщение с картинкой
-    try:
-        await callback.bot.send_photo(GROUP_CHAT_ID, photo=image_url, caption=quiz_intro_text)
-        logging.info("Первое сообщение с картинкой отправлено в группу.")
-    except Exception as e:
-        logging.error(f"Ошибка при отправке картинки: {e}")
+        correct_answer = task.correct_answer
+        logging.info(f"Неверные ответы: {wrong_answers}")
+        logging.info(f"Правильный ответ: {correct_answer}")
 
-    # Текст для опроса
-    poll_text = "Каким будет вывод?"
+        # Добавляем вариант "Не знаю, но хочу узнать"
+        options = wrong_answers + [correct_answer, "Я не знаю, но хочу узнать"]
 
-    # Отправляем опрос
-    try:
-        await callback.bot.send_message(chat_id=GROUP_CHAT_ID, text=poll_text)
-        await callback.bot.send_poll(
+        # Отправляем текст опроса
+        poll_text = "Каким будет вывод?"
+        await message.bot.send_message(chat_id=GROUP_CHAT_ID, text=poll_text)
+
+        # Отправляем сам опрос
+        await message.bot.send_poll(
             chat_id=GROUP_CHAT_ID,
-            question=data['question'],
-            options=data['answers'],
+            question=task.question,
+            options=options,
             type="quiz",
-            correct_option_id=data['answers'].index(data['correct_answer']),
-            explanation=data['explanation'],
+            correct_option_id=options.index(correct_answer),  # Индекс правильного ответа
+            explanation=task.explanation,
             is_anonymous=False
         )
-        logging.info("Опрос отправлен в группу.")
-    except Exception as e:
-        logging.error(f"Ошибка при отправке опроса: {e}")
+        logging.info(f"Опрос опубликован: {task.question}")
 
-    # Добавляем кнопку "Узнать больше"
-    try:
-        await callback.bot.send_message(
+        # Отправляем кнопку "Узнать больше"
+        await message.bot.send_message(
             chat_id=GROUP_CHAT_ID,
             text="Узнать подробнее:",
             reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="Узнать подробнее", url=data['resource_link'])]
+                [types.InlineKeyboardButton(text="Узнать подробнее", url=task.resource_link)]
             ])
         )
         logging.info("Кнопка 'Узнать больше' отправлена.")
     except Exception as e:
-        logging.error(f"Ошибка при отправке кнопки 'Узнать больше': {e}")
+        logging.error(f"Ошибка при публикации задачи: {e}")
 
-    # Сохраняем задачу в базу данных
+
+
+
+@group_publisher_router.message(Command("publish_tasks"))
+async def publish_tasks_in_group(message: types.Message, session: AsyncSession):
+    tasks = await fetch_tasks(session)
+
+    if not tasks:
+        await message.answer("Нет задач для публикации.")
+        logging.info("Нет задач для публикации.")
+        return
+
+    for i, task in enumerate(tasks):
+        try:
+            await publish_task(message, task)
+            if (i + 1) % 2 == 0:
+                await asyncio.sleep(20)  # Пауза 15 секунд после пары сообщений
+            else:
+                await asyncio.sleep(3)  # Пауза 1 секунда между сообщениями
+        except Exception as e:
+            if "Flood control exceeded" in str(e):
+                retry_after = int(str(e).split("retry after ")[1].split()[0])
+                logging.warning(f"Попадание в Flood control, пауза на {retry_after + 10} секунд...")
+                await asyncio.sleep(retry_after + 10)
+            else:
+                logging.error(f"Неожиданная ошибка: {e}")
+                break
+
+    await message.answer("Все задачи успешно опубликованы.")
+    logging.info("Все задачи успешно опубликованы.")
+
+
+
+
+@group_publisher_router.message(Command("publish_task"))
+async def publish_task_by_id(message: types.Message, session: AsyncSession):
+    """
+    Публикует конкретную задачу по её ID.
+    """
     try:
-        new_task = Task(
-            topic=data['topic'],
-            subtopic=data.get('subtopic', ''),
-            question=data['question'],
-            correct_answer=data['correct_answer'],
-            wrong_answers=",".join([a for a in data['answers'] if a != data['correct_answer']]),
-            explanation=data['explanation'],
-            resource_link=data['resource_link'],
-            image_url=image_url,
-            short_description=data.get('short_description')  # Теперь это поле необязательное
-        )
-        session.add(new_task)
-        await session.commit()
-        logging.info(f"Задача сохранена в базе данных: {new_task.id}")
-    except Exception as e:
-        logging.error(f"Ошибка при сохранении задачи в базе данных: {e}")
+        task_id = int(message.text.split()[1])  # Получаем ID задачи из сообщения
+    except (IndexError, ValueError):
+        await message.answer("Пожалуйста, укажите корректный ID задачи. Пример: /publish_task 1")
+        return
 
-    # Удаляем временный файл изображения
-    if os.path.exists(data['temp_image_path']):
-        os.remove(data['temp_image_path'])
-        logging.info("Временный файл изображения удалён.")
+    task = await fetch_task_by_id(session, task_id)
 
-    # Очищаем состояние
-    await callback.message.edit_reply_markup(reply_markup=get_task_or_json_keyboard())
-    await state.clear()
+    if not task:
+        await message.answer(f"Задача с ID {task_id} не найдена.")
+        logging.info(f"Задача с ID {task_id} не найдена.")
+        return
 
+    await publish_task(message, task)
+    await message.answer(f"Задача с ID {task_id} успешно опубликована.")
+    logging.info(f"Задача с ID {task_id} успешно опубликована.")

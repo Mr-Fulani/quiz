@@ -3,10 +3,11 @@ import os
 from logging.config import fileConfig
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
-from alembic import context
+from alembic import context, op
 from database.models import Base  # Импортируй модели
 from dotenv import load_dotenv
 import logging
+import sqlalchemy as sa
 
 # Загрузка конфигурации логов Alembic
 config = context.config
@@ -68,3 +69,22 @@ if context.is_offline_mode():
 else:
     logger.info("Запуск миграции в онлайн-режиме...")
     asyncio.run(run_migrations_async())
+
+
+
+
+
+
+
+def upgrade():
+    # Применяем изменение типа для колонки wrong_answers
+    op.execute("ALTER TABLE tasks ALTER COLUMN wrong_answers TYPE JSON USING wrong_answers::json")
+
+
+def downgrade():
+    # Откат миграции (если потребуется вернуться обратно на строку)
+    op.alter_column('tasks', 'wrong_answers', type_=sa.Text)
+
+
+
+

@@ -2,6 +2,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
+# Клавиатура выбора темы
 def topic_keyboard():
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text="Python", callback_data="topic_python"))
@@ -11,21 +12,25 @@ def topic_keyboard():
     return builder.as_markup()
 
 
+# Клавиатура подтверждения публикации
 def get_confirmation_keyboard() -> InlineKeyboardMarkup:
-    """
-    Возвращает инлайн-клавиатуру с кнопками "Запустить" и "Отменить".
-    """
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text="Запустить", callback_data="confirm_launch"))
     builder.add(InlineKeyboardButton(text="Отменить", callback_data="confirm_cancel"))
     return builder.as_markup()
 
 
-
-
-
+# Клавиатура выбора действия после публикации
 def get_task_or_json_keyboard():
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text="Новая задача", callback_data="new_task"))
     builder.add(InlineKeyboardButton(text="JSON с задачами", callback_data="upload_json"))
+    return builder.as_markup()
+
+
+# Клавиатура отправки в группу
+def get_publish_group_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Отправить в группу", callback_data="publish_to_group")
+    builder.button(text="Новая задача", callback_data="new_task")
     return builder.as_markup()
