@@ -2,11 +2,13 @@ import io
 import json
 import os
 import logging
-
+from random import random
 
 from PIL import Image
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.image_service import generate_console_image, generate_image_name
@@ -16,7 +18,8 @@ from bot.keyboards.inline import get_confirmation_keyboard, get_task_or_json_key
     get_publish_group_keyboard
 from bot.states import QuizStates
 from config import GROUP_CHAT_ID
-from database.models import Task
+from database.models import Task, Group
+from datetime import datetime
 
 
 
@@ -232,24 +235,19 @@ async def process_resource_link(message: types.Message, state: FSMContext):
 
 
 
-
-
 @quiz_router.callback_query(lambda query: query.data == "confirm_launch")
 async def confirm_quiz(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
-    """
-    Обработчик подтверждения публикации опроса и сохранения задачи в базе данных.
-    """
     data = await state.get_data()
+    logging.info(f"Полученные данные из состояния: {data}")
 
     # Генерация имени для изображения
     image_name = generate_image_name(data['topic'])
+    logging.info(f"Генерация имени изображения: {image_name}")
 
     try:
         # Загрузка изображения в S3
         image_url = upload_to_s3(Image.open(data['temp_image_path']), image_name)
         logging.info(f"Изображение успешно загружено в S3: {image_url}")
-
-        # Обновление состояния с URL изображения
         await state.update_data(image_url=image_url)
     except Exception as e:
         logging.error(f"Ошибка при загрузке изображения в S3: {e}")
@@ -259,12 +257,16 @@ async def confirm_quiz(callback: types.CallbackQuery, state: FSMContext, session
     # Подготовка данных для сохранения
     correct_answer = data.get('correct_answer')
     answers = data.get('answers', [])
-
-    # Убираем правильный ответ из списка неправильных ответов
     wrong_answers = [answer for answer in answers if answer != correct_answer]
 
     logging.info(f"Правильный ответ: {correct_answer}")
     logging.info(f"Неправильные ответы: {wrong_answers}")
+
+    # Проверка наличия всех необходимых данных
+    if not all([data['topic'], correct_answer, wrong_answers, data['explanation'], image_url]):
+        logging.error("Не все необходимые поля заполнены")
+        await callback.message.answer("Ошибка: не все необходимые данные предоставлены")
+        return
 
     # Отправляем изображение пользователю
     try:
@@ -289,28 +291,44 @@ async def confirm_quiz(callback: types.CallbackQuery, state: FSMContext, session
 
     # Сохранение задачи в базу данных
     try:
-        new_task = Task(
-            topic=data['topic'],
-            subtopic=data.get('subtopic', ''),
-            question=data['question'],
-            correct_answer=correct_answer,
-            wrong_answers=wrong_answers,  # Сохраняем только неправильные ответы
-            explanation=data['explanation'],
-            resource_link=data['resource_link'],
-            image_url=image_url,  # Используем URL изображения
-            short_description=data.get('short_description')  # Сохраняем описание, если есть
-        )
-        session.add(new_task)
-        await session.commit()
-        logging.info(f"Задача сохранена в базе данных: {new_task.id}")
+        async with session.begin():
+            new_task = Task(
+                topic=data['topic'],
+                subtopic=data.get('subtopic', ''),
+                question=data['question'],
+                correct_answer=correct_answer,
+                wrong_answers=wrong_answers,
+                explanation=data['explanation'],
+                resource_link=data['resource_link'],
+                image_url=image_url,
+                short_description=data.get('short_description', ''),
+                default_language=data.get('default_language', 'ru')
+            )
+            session.add(new_task)
+            await session.flush()  # Чтобы получить id новой задачи
+            logging.info(f"Задача сохранена в базе данных: {new_task.id}")
+
+            # Сохраняем ID задачи в состояние FSM
+            await state.update_data(task_id=new_task.id)
+
+        # Подтверждение сохранения
+        await callback.message.answer(f"Задача успешно сохранена с ID: {new_task.id}")
+
     except Exception as e:
         logging.error(f"Ошибка при сохранении задачи в базе данных: {e}")
-        await callback.message.answer(f"Ошибка при сохранении задачи в базе данных: {e}")
+        await callback.message.answer(f"Ошибка при сохранении задачи в базе данных: {str(e)}")
+        return
 
-    # # Очистка временного файла изображения
-    # if os.path.exists(data['temp_image_path']):
-    #     os.remove(data['temp_image_path'])
-    #     logging.info("Временный файл изображения удалён.")
+    # Не очищаем состояние здесь, чтобы сохранить task_id для следующей функции
+    logging.info(f"Состояние после сохранения задачи: {await state.get_data()}")
+
+    # Предложение опубликовать задачу
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("Опубликовать в группе", callback_data="publish_to_group"))
+    await callback.message.answer("Хотите опубликовать эту задачу в группе?", reply_markup=keyboard)
+
+
+
 
     # Появление кнопки для отправки в группу
     await callback.message.answer("Викторина успешно запущена. Выберите действие:", reply_markup=get_publish_group_keyboard())
@@ -365,6 +383,8 @@ async def upload_tasks_via_json(callback: types.CallbackQuery, state: FSMContext
 
 
 
+
+
 @quiz_router.message(QuizStates.waiting_for_file, F.document)
 async def process_tasks_file(message: types.Message, state: FSMContext, session: AsyncSession):
     try:
@@ -381,12 +401,26 @@ async def process_tasks_file(message: types.Message, state: FSMContext, session:
         file_buffer.seek(0)
 
         # Читаем содержимое как JSON
-        tasks = json.load(file_buffer)
+        data = json.load(file_buffer)
+
+        # Проверяем, что JSON содержит ключ 'tasks' и что это список
+        if not isinstance(data, dict) or 'tasks' not in data or not isinstance(data['tasks'], list):
+            await message.answer("Ошибка: Некорректная структура JSON-файла. Ожидался объект с ключом 'tasks', содержащий массив задач.")
+            return
+
+        tasks = data['tasks']
         logging.info(f"Загружено задач: {len(tasks)}")
 
         for task in tasks:
-            # Генерация изображения для каждой задачи
-            image = generate_console_image(task['question'], "assets/logo.png")
+            # Генерация изображения для каждой задачи (используем язык по умолчанию)
+            default_language = task.get('default_language', 'ru')
+            question = task['question'].get(default_language, '')
+            correct_answer = task['correct_answer'].get(default_language, '')
+            wrong_answers = task['wrong_answers'].get(default_language, [])
+            explanation = task['explanation'].get(default_language, '')
+            short_description = task['short_description'].get(default_language, '')
+
+            image = generate_console_image(question, "assets/logo.png")
             image_name = generate_image_name(task['topic'])
             image_url = upload_to_s3(image, image_name)
 
@@ -394,13 +428,15 @@ async def process_tasks_file(message: types.Message, state: FSMContext, session:
             new_task = Task(
                 topic=task['topic'],
                 subtopic=task.get('subtopic', ''),
-                question=task['question'],
-                correct_answer=task['correct_answer'],
-                wrong_answers=task['wrong_answers'],  # Сохраняем как JSON
-                explanation=task['explanation'],
+                question=question,
+                correct_answer=correct_answer,
+                wrong_answers=wrong_answers,  # Сохраняем как JSON
+                explanation=explanation,
                 resource_link=task['resource_link'],
                 image_url=image_url,
-                short_description=task.get('short_description', None)
+                short_description=short_description,
+                default_language=default_language,
+                language=task.get('language', default_language)
             )
             session.add(new_task)
 
@@ -409,12 +445,14 @@ async def process_tasks_file(message: types.Message, state: FSMContext, session:
         logging.info(f"Все задачи сохранены в базу данных.")
         await message.answer(f"Загружено задач: {len(tasks)}")
 
+        # Сохраняем ID последней задачи в состояние FSM
+        await state.update_data(task_id=new_task.id)
+
     except json.JSONDecodeError:
         await message.answer("Ошибка: Неверный формат файла. Пожалуйста, загрузите корректный JSON-файл.")
     except Exception as e:
         logging.error(f"Ошибка при загрузке файла: {e}")
         await message.answer(f"Ошибка при загрузке файла: {e}")
-
 
 
 
@@ -448,44 +486,129 @@ async def confirm_cancel(callback: types.CallbackQuery, state: FSMContext):
 
 
 
+
 @quiz_router.callback_query(lambda query: query.data == "publish_to_group")
 async def publish_to_group(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
     """
-    Обработчик отправки задачи в группу.
+    Публикация задачи в группу после подтверждения.
     """
     data = await state.get_data()
+    logging.info(f"Данные из состояния: {data}")
 
-    group_chat_id = GROUP_CHAT_ID  # Замените на ваш ID группы
-
-    # Отправляем изображение в группу
-    try:
-        await callback.bot.send_photo(
-            chat_id=group_chat_id,
-            photo=data['image_url'],
-            caption=f"Тема: {data['topic']}\nПодтема: {data.get('subtopic', 'Без подтемы')}"
-        )
-        logging.info("Изображение отправлено в группу.")
-    except Exception as e:
-        logging.error(f"Ошибка при отправке изображения в группу: {e}")
-        await callback.message.answer(f"Ошибка при отправке изображения в группу: {e}")
+    task_id = data.get('task_id')
+    if not task_id:
+        logging.error("Ошибка: ID задачи отсутствует.")
+        await callback.message.answer("Ошибка: ID задачи отсутствует.")
         return
 
-    # Отправляем викторину в группу
     try:
-        answers = data['answers']
-        if "Я не знаю, но хочу узнать" not in answers:
-            answers.append("Я не знаю, но хочу узнать")
+        # Извлекаем задачу из базы данных
+        task = await session.get(Task, task_id)
+        if not task:
+            logging.error(f"Ошибка: задача с ID {task_id} не найдена.")
+            await callback.message.answer(f"Ошибка: задача с ID {task_id} не найдена.")
+            return
 
-        await callback.bot.send_poll(
-            chat_id=group_chat_id,
-            question=data['question'],
-            options=answers,
-            type="quiz",
-            correct_option_id=answers.index(data['correct_answer']),
-            explanation=data['explanation'],
-            is_anonymous=False
+        logging.info(
+            f"Задача до публикации: id={task.id}, published={task.published}, publish_date={task.publish_date}")
+
+        if task.published:
+            logging.info(f"Задача с ID {task_id} уже была опубликована.")
+            await callback.message.answer("Эта задача уже была опубликована.")
+            return
+
+        group_chat_id = int(GROUP_CHAT_ID)
+        logging.info(f"ID группы для публикации: {group_chat_id}")
+
+        # Отправляем изображение в группу
+        try:
+            await callback.bot.send_photo(
+                chat_id=group_chat_id,
+                photo=task.image_url,
+                caption=f"Тема: {task.topic}\nПодтема: {task.subtopic or 'Без подтемы'}"
+            )
+            logging.info(f"Изображение отправлено в группу: {task.image_url}")
+        except Exception as e:
+            logging.error(f"Ошибка при отправке изображения в группу: {e}")
+            await callback.message.answer(f"Ошибка при отправке изображения в группу: {e}")
+            return
+
+        # Формирование списка вариантов ответа
+        try:
+            options = task.wrong_answers + [task.correct_answer]  # Добавляем правильный ответ к неверным
+            logging.info(f"Варианты ответа: {options}")
+
+            # Получение индекса правильного ответа
+            correct_option_id = options.index(task.correct_answer)
+
+            # Отправляем викторину в группу
+            await callback.bot.send_poll(
+                chat_id=group_chat_id,
+                question=task.question,
+                options=options,
+                type="quiz",
+                correct_option_id=correct_option_id,
+                explanation=task.explanation,
+                is_anonymous=False
+            )
+            logging.info(f"Викторина отправлена: {task.question}")
+        except ValueError as e:
+            logging.error(f"Ошибка при отправке викторины: {e}")
+            await callback.message.answer(f"Ошибка при отправке викторины: {e}")
+            return
+        except Exception as e:
+            logging.error(f"Ошибка при отправке викторины в группу: {e}")
+            await callback.message.answer(f"Ошибка при отправке викторины в группу: {e}")
+            return
+
+        # Лог перед началом запроса к базе данных
+        logging.info(f"Поиск группы с group_id: {group_chat_id} в базе данных.")
+        # Находим группу
+        group = await session.execute(select(Group).where(Group.group_id == group_chat_id))
+        group_instance = group.scalar_one_or_none()
+        logging.info(f"Результат запроса группы: {group_instance}")
+
+        if group_instance is None:
+            logging.error(f"Группа с group_id {group_chat_id} не найдена в базе данных.")
+            await callback.message.answer(f"Ошибка: Группа с ID {group_chat_id} не найдена в базе данных.")
+            return
+
+        # Обновляем задачу
+        current_time = datetime.utcnow()
+        stmt = (
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                published=True,
+                publish_date=current_time,
+                group_id=group_instance.id
+            )
         )
-        logging.info("Викторина отправлена в группу.")
+        await session.execute(stmt)
+
+        # Лог перед коммитом изменений в базе данных
+        logging.info(f"Обновление задачи в базе данных: {task_id}")
+        # Выполняем коммит
+        await session.commit()
+        logging.info("Коммит выполнен успешно")
+
+        # Проверяем, что изменения действительно сохранились
+        updated_task = await session.get(Task, task_id)
+        logging.info(
+            f"Задача после обновления: id={updated_task.id}, published={updated_task.published}, publish_date={updated_task.publish_date}, group_id={updated_task.group_id}")
+
+        if updated_task.published and updated_task.publish_date and updated_task.group_id == group_instance.id:
+            await callback.message.answer(f"Задача успешно опубликована в группе.")
+            logging.info(f"Задача с ID {task_id} успешно опубликована и обновлена в базе данных.")
+        else:
+            logging.error(f"Обновление задачи не удалось. Текущее состояние: {updated_task}")
+            await callback.message.answer("Произошла ошибка при публикации задачи. Пожалуйста, попробуйте еще раз.")
+
     except Exception as e:
-        logging.error(f"Ошибка при отправке викторины в группу: {e}")
-        await callback.message.answer(f"Ошибка при отправке викторины в группу: {e}")
+        logging.error(f"Ошибка при публикации задачи: {e}")
+        await callback.message.answer(f"Произошла ошибка при публикации задачи: {str(e)}")
+        await session.rollback()
+        logging.info("Выполнен откат изменений")
+    finally:
+        await state.clear()
+        logging.info("Состояние очищено.")

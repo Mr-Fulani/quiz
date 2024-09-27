@@ -1,4 +1,3 @@
-# quiz
 ### Документация по проекту Telegram-бота (Русский)
 
 ---
@@ -231,4 +230,60 @@ Users interact with the bot through the chat interface to create tasks step by s
 
 ### 2. Task Publication to Groups
 
-The bot supports publishing tasks to different Telegram groups or channels depending on their topic.
+The bot supports publishing tasks to different Telegram groups or channels depending on their topic. After creating a task, the user can choose which group to send it to. For example, Python tasks are published to a Python group.
+
+The publication process consists of two stages:
+- Sending the task's image with a brief description.
+- Sending the quiz as a poll with answer options.
+
+### 3. Managing User Subscriptions
+
+To access premium features (e.g., exclusive tasks or statistics), users can subscribe. The bot checks the subscription status before granting access to certain features.
+
+### 4. Uploading Tasks via JSON
+
+The bot supports bulk task uploads via JSON files. Admins can upload a file with tasks, and all tasks are automatically saved in the database. This feature is useful for adding a large number of tasks quickly.
+
+---
+
+## Key Commands
+
+- **/start**  
+  Welcomes the user and registers them in the system if they aren't already registered.
+
+- **/new_task**  
+  Starts the process of creating a new task.
+
+- **/upload_json**  
+  Allows uploading a JSON file with tasks.
+
+- **/subscription**  
+  Checks the user's subscription status.
+
+- **/help**  
+  Displays the list of available commands and how to use the bot.
+
+### Inline Buttons:
+
+- **Launch**  
+  Confirms and publishes the task.
+
+- **Publish to Group**  
+  Sends the task to the selected group.
+
+- **Cancel**  
+  Cancels the current task or action.
+
+---
+
+## Future Improvements
+
+1. **Adding User Statistics**: tracking how users interact with tasks and which tasks have been solved.
+
+2. **Multi-level Publication System**: supporting multiple groups for different topics, where each group receives tasks only for its specific theme.
+
+3. **Subscription Notifications**: adding subscription renewal notifications and integrating with payment systems for automatic renewal.
+
+---
+
+Эта документация поможет новичкам лучше понять архитектуру проекта и легко внести изменения или улучшения.

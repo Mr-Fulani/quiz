@@ -10,3 +10,12 @@ __pycache__/
 .DS_Store
 *.log
 *.sqlite3
+
+
+add_group.py
+add_test_data.py
+test_db.py
+reset_database.py
+
+
+tasks.json

@@ -15,3 +15,6 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")   # Укажите ваш chat_id группы
+
+
+DATABASE_URL = os.getenv('DATABASE_URL')

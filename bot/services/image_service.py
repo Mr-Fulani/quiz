@@ -2,6 +2,7 @@ import os
 import io
 import hashlib
 import datetime
+from uuid import uuid4
 
 from PIL import Image, ImageDraw, ImageFont
 from pygments import highlight
@@ -161,6 +162,15 @@ def generate_image_name(topic: str) -> str:
     image_name = f"{topic}_{timestamp}.png"
     return image_name
 
+
+
+
+
+
+
+def generate_image_name(topic):
+    unique_id = uuid4().hex
+    return f"{topic}_{unique_id}.png"
 
 
 
