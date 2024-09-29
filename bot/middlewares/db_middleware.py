@@ -1,14 +1,25 @@
-from aiogram.types import TelegramObject
-from aiogram.dispatcher.middlewares.base import BaseMiddleware
+import logging
+from aiogram import BaseMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from database.database import get_async_session
+from sqlalchemy.orm import sessionmaker
 
 
 
 class DbSessionMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event: TelegramObject, data: dict):
-        # Получаем сессию базы данных
-        async for session in get_async_session():
-            # Добавляем сессию в `data`, чтобы передать её в обработчик
+    def __init__(self, session_maker: sessionmaker):
+        super().__init__()
+        self.session_maker = session_maker
+
+
+    async def __call__(self, handler, event, data):
+        # Создаем асинхронную сессию
+        async with self.session_maker() as session:
             data['session'] = session
-            return await handler(event, data)
+            try:
+                # Передаем обработку в хендлер с добавленной сессией
+                return await handler(event, data)
+            except Exception as e:
+                logging.error(f"Ошибка при работе с сессией базы данных: {e}")
+                raise
+            finally:
+                await session.close()

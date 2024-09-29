@@ -1,8 +1,10 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
+import random
 from zoneinfo import ZoneInfo
 
+import aiogram
 from aiogram import Router, types
 from aiogram.filters import Command
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,8 +12,10 @@ from sqlalchemy.future import select
 from database.models import Task, Group
 from config import GROUP_CHAT_ID
 
+
 # Создаем роутер
 group_publisher_router = Router()
+
 
 # Настройка логирования
 logging.basicConfig(
@@ -48,60 +52,161 @@ async def fetch_task_by_id(session: AsyncSession, task_id: int):
 
 
 
-async def publish_task(message: types.Message, task: Task, session: AsyncSession):
+
+
+
+async def get_group_for_task(session: AsyncSession, task: Task):
     """
-    Публикует одну задачу в группу.
+    Получает группу из базы данных, соответствующую теме и языку задачи.
     """
     try:
-        # Отправляем картинку с темой и подтемой
-        intro_text = (
-            f"Тема: {task.topic}\n"
-            f"Подтема: {task.subtopic or 'Без подтемы'}"
-        )
-        await message.bot.send_photo(chat_id=GROUP_CHAT_ID, photo=task.image_url, caption=intro_text)
-        logging.info(f"Сообщение с картинкой отправлено: {task.image_url}")
+        group_query = select(Group).where(Group.topic == task.topic, Group.language == task.language)
+        group_result = await session.execute(group_query)
+        group_instance = group_result.scalar_one_or_none()
 
-        # Проверяем и логируем правильные и неправильные ответы
-        wrong_answers = task.wrong_answers
-        if not isinstance(wrong_answers, list):
-            logging.error(f"Ожидался список неправильных ответов, но получено: {type(wrong_answers)}")
+        if group_instance:
+            logging.info(f"Найдена группа для публикации: ID={group_instance.id}, Имя={group_instance.group_name}, Язык={group_instance.language}")
+            return group_instance
+        else:
+            logging.warning(f"Группа для темы '{task.topic}' и языка '{task.language}' не найдена.")
+            return None
+    except Exception as e:
+        logging.error(f"Ошибка при получении группы для задачи: {e}")
+        return None
+
+
+
+
+
+async def publish_task(message: types.Message, task: Task, session: AsyncSession):
+    """
+    Публикует одну задачу в соответствующую группу на основе языка и темы задачи.
+    """
+
+    # Словари для различных фраз на нескольких языках
+    DONT_KNOW_OPTIONS = {
+        'ru': "Я не знаю, но хочу узнать",
+        'en': "I don't know, but I want to learn",
+        'es': "No lo sé, pero quiero aprender",
+        'tr': "Bilmiyorum, ama öğrenmek istiyorum"
+    }
+
+    LEARN_MORE_TEXT = {
+        'ru': "Узнать подробнее",
+        'en': "Learn more",
+        'es': "Saber más",
+        'tr': "Daha fazla öğren"
+    }
+
+    POLL_TEXT = {
+        'ru': "Каким будет вывод?",
+        'en': "What will be the output?",
+        'es': "¿Cuál será el resultado?",
+        'tr': "Çıktı ne olacak?"
+    }
+
+    try:
+        # Получаем язык и тему задачи
+        language = task.language
+        topic = task.topic
+
+        # Получаем внутренний ID группы из базы данных по языку и теме
+        group_query = select(Group).where(Group.language == language, Group.topic == topic)
+        group_instance = (await session.execute(group_query)).scalar_one_or_none()
+
+        if not group_instance:
+            await message.answer(
+                f"Группа для темы '{task.topic}' и языка '{task.language}' не найдена. "
+                "Задача сохранена, но публикация не выполнена."
+            )
+            logging.error(f"Группа для темы '{task.topic}' и языка '{task.language}' не найдена. Публикация отменена.")
             return
 
-        correct_answer = task.correct_answer
-        logging.info(f"Неверные ответы: {wrong_answers}")
-        logging.info(f"Правильный ответ: {correct_answer}")
+        group_chat_id = group_instance.group_id  # Реальный Telegram ID группы
+        group_db_id = group_instance.id  # Внутренний ID группы в базе данных
 
-        # Добавляем вариант "Не знаю, но хочу узнать"
-        options = wrong_answers + [correct_answer, "Я не знаю, но хочу узнать"]
+        # Отправляем картинку с темой и подтемой
+        intro_text = f"Тема: {task.topic}\nПодтема: {task.subtopic or 'Без подтемы'}"
+        try:
+            await message.bot.send_photo(chat_id=group_chat_id, photo=task.image_url, caption=intro_text)
+            logging.info(f"Сообщение с картинкой отправлено в группу {group_chat_id}: {task.image_url}")
+        except aiogram.exceptions.TelegramRetryAfter as e:
+            logging.warning(f"Попадание в лимит Telegram: ждем {e.retry_after} секунд.")
+            await asyncio.sleep(e.retry_after)
+            return await publish_task(message, task, session)  # Повтор после ожидания
+        except Exception as e:
+            logging.error(f"Ошибка при отправке изображения в группу: {e}")
+            await message.answer(f"Ошибка при отправке изображения в группу: {e}")
+            return
+
+        # Перемешиваем варианты ответов и добавляем вариант "Я не знаю, но хочу узнать" в конец
+        wrong_answers = task.wrong_answers
+        correct_answer = task.correct_answer
+        options = wrong_answers + [correct_answer]
+
+        random.shuffle(options)
+
+        # Добавляем вариант "Я не знаю, но хочу узнать" на языке задачи
+        dont_know_option = DONT_KNOW_OPTIONS.get(task.language, "Я не знаю, но хочу узнать")
+        options.append(dont_know_option)
+        correct_option_id = options.index(correct_answer)
 
         # Отправляем текст опроса
-        poll_text = "Каким будет вывод?"
-        await message.bot.send_message(chat_id=GROUP_CHAT_ID, text=poll_text)
+        poll_text = POLL_TEXT.get(task.language, "Каким будет вывод?")
+        try:
+            await message.bot.send_message(chat_id=group_chat_id, text=poll_text)
+        except aiogram.exceptions.TelegramRetryAfter as e:
+            logging.warning(f"Попадание в лимит Telegram: ждем {e.retry_after} секунд.")
+            await asyncio.sleep(e.retry_after)
+            return await publish_task(message, task, session)  # Повтор после ожидания
+        except Exception as e:
+            logging.error(f"Ошибка при отправке текста опроса: {e}")
+            await message.answer(f"Ошибка при отправке текста опроса: {e}")
+            return
 
         # Отправляем сам опрос
-        await message.bot.send_poll(
-            chat_id=GROUP_CHAT_ID,
-            question=task.question,
-            options=options,
-            type="quiz",
-            correct_option_id=options.index(correct_answer),  # Индекс правильного ответа
-            explanation=task.explanation,
-            is_anonymous=False
-        )
-        logging.info(f"Опрос опубликован: {task.question}")
+        try:
+            await message.bot.send_poll(
+                chat_id=group_chat_id,
+                question=task.question,
+                options=options,
+                type="quiz",
+                correct_option_id=correct_option_id,
+                explanation=task.explanation,
+                is_anonymous=False
+            )
+            logging.info(f"Опрос опубликован в группе {group_chat_id}: {task.question}")
+        except aiogram.exceptions.TelegramRetryAfter as e:
+            logging.warning(f"Попадание в лимит Telegram: ждем {e.retry_after} секунд.")
+            await asyncio.sleep(e.retry_after)
+            return await publish_task(message, task, session)  # Повтор после ожидания
+        except Exception as e:
+            logging.error(f"Ошибка при отправке опроса: {e}")
+            await message.answer(f"Ошибка при отправке опроса: {e}")
+            return
 
         # Отправляем кнопку "Узнать больше"
-        await message.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text="Узнать подробнее:",
-            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="Узнать подробнее", url=task.resource_link)]
-            ])
-        )
-        logging.info("Кнопка 'Узнать больше' отправлена.")
+        learn_more_text = LEARN_MORE_TEXT.get(task.language, "Узнать больше")
+        try:
+            await message.bot.send_message(
+                chat_id=group_chat_id,
+                text="Узнать подробнее:",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                    [types.InlineKeyboardButton(text=learn_more_text, url=task.resource_link)]
+                ])
+            )
+            logging.info(f"Кнопка 'Узнать больше' отправлена в группу {group_chat_id}.")
+        except aiogram.exceptions.TelegramRetryAfter as e:
+            logging.warning(f"Попадание в лимит Telegram: ждем {e.retry_after} секунд.")
+            await asyncio.sleep(e.retry_after)
+            return await publish_task(message, task, session)  # Повтор после ожидания
+        except Exception as e:
+            logging.error(f"Ошибка при отправке кнопки 'Узнать больше': {e}")
+            await message.answer(f"Ошибка при отправке кнопки 'Узнать больше': {e}")
+            return
 
         # Обновляем поля задачи в базе данных после успешной публикации
-        success = await update_task_in_db(session, task, GROUP_CHAT_ID)
+        success = await update_task_in_db(session, task, group_db_id)  # Используем внутренний ID группы
         if success:
             logging.info(f"Поля задачи с ID {task.id} успешно обновлены.")
         else:
@@ -111,52 +216,28 @@ async def publish_task(message: types.Message, task: Task, session: AsyncSession
         logging.error(f"Ошибка при публикации задачи: {e}")
 
 
-
-
-from datetime import datetime, timezone
-
-async def update_task_in_db(session: AsyncSession, task: Task, group_chat_id):
+async def update_task_in_db(session: AsyncSession, task: Task, group_db_id):
     """
     Обновляет поля задачи в базе данных.
     """
     try:
-        # Приведение group_chat_id к числу, если это строка
-        if isinstance(group_chat_id, str):
-            group_chat_id = int(group_chat_id)
-
         # Устанавливаем необходимые поля
         task.published = True
-        # Убираем информацию о временной зоне
         task.publish_date = datetime.now(timezone.utc).replace(tzinfo=None)
+        task.group_id = group_db_id  # Используем внутренний ID группы в базе данных
 
         # Добавляем объект `task` в сессию, чтобы убедиться, что он отслеживается
         session.add(task)
 
-        # Используем обычный контекстный менеджер `with` вместо `async with`
-        with session.no_autoflush:
-            group_instance = await session.execute(
-                select(Group).where(Group.group_id == group_chat_id)
-            )
-            group_instance = group_instance.scalar_one_or_none()
-
-            if group_instance:
-                task.group_id = group_instance.group_id
-                # Логирование перед коммитом
-                logging.info(f"Перед коммитом: task.published = {task.published}, task.publish_date = {task.publish_date}")
-                await session.commit()
-                # Логирование после коммита
-                logging.info(f"После коммита: task.published = {task.published}, task.publish_date = {task.publish_date}")
-            else:
-                logging.error(f"Группа с ID {group_chat_id} не найдена в базе данных.")
-                await session.rollback()
-                return False
+        # Коммитим изменения
+        await session.commit()
+        logging.info(f"Задача с ID {task.id} успешно обновлена в базе данных.")
+        return True
 
     except Exception as e:
         logging.exception(f"Ошибка при обновлении задачи с ID {task.id}: {e}")
         await session.rollback()
         return False
-
-    return True
 
 
 

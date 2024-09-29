@@ -82,3 +82,4 @@ class Group(Base):
     group_name = Column(String, nullable=False)
     group_id = Column(BigInteger, unique=True, nullable=False)
     topic = Column(String, nullable=False)
+    language = Column(String, nullable=False)  # Добавляем поле языка

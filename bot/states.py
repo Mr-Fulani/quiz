@@ -16,3 +16,4 @@ class QuizStates(StatesGroup):
     waiting_for_file = State()  # Ожидание загрузки файла с задачами (новое состояние)
     waiting_for_post_time = State()
     waiting_for_subtopic = State()
+    waiting_for_language = State()

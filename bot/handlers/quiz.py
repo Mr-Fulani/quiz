@@ -1,9 +1,11 @@
+import asyncio
 import io
 import json
 import os
 import logging
-from random import random
+import random
 
+import aiogram
 from PIL import Image
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
@@ -14,20 +16,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.services.image_service import generate_console_image, generate_image_name
 from bot.services.s3_service import upload_to_s3
 from bot.services.text_service import is_valid_url
-from bot.keyboards.inline import get_confirmation_keyboard, get_task_or_json_keyboard, topic_keyboard, \
-    get_publish_group_keyboard
+from bot.services.message_service import send_message_with_retry, send_photo_with_retry  # Добавлено для обработки ожидания
+from bot.keyboards.inline import (
+    get_confirmation_keyboard, get_task_or_json_keyboard, topic_keyboard,
+    get_publish_group_keyboard, main_menu_keyboard
+)
 from bot.states import QuizStates
 from config import GROUP_CHAT_ID
 from database.models import Task, Group
 from datetime import datetime
 
 
-
-
-
-
 quiz_router = Router()
-
 
 # Инициализация логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -37,42 +37,60 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 async def choose_topic(callback: types.CallbackQuery, state: FSMContext):
     """
     Обработчик выбора темы викторины.
+
+    Сохраняет выбранную тему в состояние и запрашивает подтему у пользователя.
     """
     topic = callback.data.split("_")[1]
     logging.info(f"Тема выбрана: {topic}")
 
-    # Сохраняем тему в состояние
     await state.update_data(topic=topic)
 
-    # Отправляем сообщение с предложением ввести подтему или "0" для пропуска
-    await callback.message.answer(
-        f"Вы выбрали тему: {topic}. Введите подтему (например, 'Списки') или введите '0' для пропуска.")
+    # Отправляем сообщение с предложением ввести подтему
+    await send_message_with_retry(
+        bot=callback.bot,
+        chat_id=callback.message.chat.id,
+        text=f"Вы выбрали тему: {topic}. Введите подтему (например, 'Списки') или введите '0' для пропуска."
+    )
 
     # Устанавливаем состояние ожидания подтемы
     await state.set_state(QuizStates.waiting_for_subtopic)
 
 
+
 @quiz_router.message(QuizStates.waiting_for_subtopic)
 async def process_subtopic(message: types.Message, state: FSMContext):
     """
-    Обработчик ввода подтемы. Если подтемы нет, можно ввести '0'.
+    Обработчик ввода подтемы.
+
+    Если подтемы нет, пользователь может ввести '0' для пропуска.
     """
     subtopic = message.text.strip()
 
-    # Если пользователь ввел '0', пропускаем подтему
     if subtopic.lower() == "0":
-        subtopic = None  # Очищаем подтему
-        await message.answer("Вы пропустили ввод подтемы.")
+        subtopic = None
+        await send_message_with_retry(
+            bot=message.bot,
+            chat_id=message.chat.id,
+            text="Вы пропустили ввод подтемы."
+        )
+        logging.info("Подтема пропущена пользователем.")
     else:
-        await message.answer(f"Подтема выбрана: {subtopic}")
+        await send_message_with_retry(
+            bot=message.bot,
+            chat_id=message.chat.id,
+            text=f"Подтема выбрана: {subtopic}"
+        )
+        logging.info(f"Подтема выбрана: {subtopic}")
 
-    # Сохраняем подтему в состояние
     await state.update_data(subtopic=subtopic)
 
-    # Переход к следующему этапу: ввод краткого описания
-    await message.answer("Введите краткое описание задачи или введите '0' для пропуска.")
+    # Запрос краткого описания задачи
+    await send_message_with_retry(
+        bot=message.bot,
+        chat_id=message.chat.id,
+        text="Введите краткое описание задачи или введите '0' для пропуска."
+    )
     await state.set_state(QuizStates.waiting_for_short_description)
-
 
 
 
@@ -80,38 +98,68 @@ async def process_subtopic(message: types.Message, state: FSMContext):
 @quiz_router.message(QuizStates.waiting_for_short_description)
 async def process_short_description(message: types.Message, state: FSMContext):
     """
-    Обработчик ввода краткого описания задачи. Поле необязательно, можно пропустить.
+    Обработчик ввода краткого описания задачи.
+
+    Если описание пропущено, сохраняет значение None.
     """
     short_description = message.text.strip()
 
-    # Если пользователь решил пропустить описание
     if short_description == '0':
         short_description = None
-        await state.update_data(short_description=short_description)
-        await message.answer("Описание пропущено. Введите текст задачки (например, отрывок кода).")
+        await send_message_with_retry(bot=message.bot,
+        chat_id=message.chat.id,
+        text="Описание пропущено.")
         logging.info("Пользователь пропустил ввод краткого описания.")
     else:
         await state.update_data(short_description=short_description)
-        await message.answer("Описание добавлено. Введите текст задачки (например, отрывок кода).")
+        await send_message_with_retry(bot=message.bot,
+        chat_id=message.chat.id,
+        text="Описание добавлено.")
         logging.info(f"Краткое описание добавлено: {short_description}")
 
+    # Переход к этапу ввода языка
+    await send_message_with_retry(bot=message.bot,
+        chat_id=message.chat.id,
+        text="Введите язык задачи (например, 'ru' для русского, 'en' для английского).")
+    await state.set_state(QuizStates.waiting_for_language)
 
-    # Обновляем состояние FSM
-    await state.update_data(short_description=short_description)
+
+@quiz_router.message(QuizStates.waiting_for_language)
+async def process_language(message: types.Message, state: FSMContext):
+    """
+    Обработчик ввода языка задачи.
+
+    Проверяет введенный язык и сохраняет его в состояние.
+    """
+    language = message.text.strip().lower()
+
+    if language not in ['ru', 'en', 'es', 'tur']:
+        await send_message_with_retry(bot=message.bot,
+        chat_id=message.chat.id,
+        text="Недопустимый язык. Введите 'ru', 'en', 'es', или 'tur'.")
+        logging.warning(f"Неверный язык введен: {language}")
+        return
+
+    await state.update_data(language=language)
+    logging.info(f"Язык задачи сохранен: {language}")
+    await send_message_with_retry(bot=message.bot,
+        chat_id=message.chat.id,
+        text="Язык задачи сохранен. Введите текст задачи.")
+
+    # Переход к этапу ввода вопроса
     await state.set_state(QuizStates.waiting_for_question)
-
-
-
-
 
 
 @quiz_router.message(QuizStates.waiting_for_question)
 async def process_question(message: types.Message, state: FSMContext):
     """
-    Обработчик ввода текста задачки.
+    Обработчик ввода текста задачи.
+
+    Сохраняет текст задачи и генерирует изображение для предварительного просмотра.
     """
     task_text = message.text.strip()
-    logging.info(f"Текст задачки: {task_text}")
+    logging.info(f"Текст задачи: {task_text}")
+
     await state.update_data(question=task_text)
 
     logo_path = "assets/logo.png"
@@ -122,71 +170,90 @@ async def process_question(message: types.Message, state: FSMContext):
     image.save(temp_file_path)
 
     try:
-        await message.answer_photo(types.FSInputFile(temp_file_path))
+        await send_photo_with_retry(bot=message.bot,
+            chat_id=message.chat.id,
+            photo=types.FSInputFile(temp_file_path))
         logging.info("Изображение отправлено пользователю.")
-        await message.answer("Изображение задачи успешно сгенерировано. Введите 4 варианта ответа через запятую.")
+        await send_message_with_retry(bot=message.bot,
+        chat_id=message.chat.id,
+        text="Изображение задачи успешно сгенерировано. Введите 4 варианта ответа через запятую.")
     except Exception as e:
         logging.error(f"Ошибка при отправке изображения: {e}")
-        await message.answer(f"Ошибка при отправке изображения: {str(e)}")
+        await send_message_with_retry(bot=message.bot,
+        chat_id=message.chat.id,
+        text=f"Ошибка при отправке изображения: {str(e)}")
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
             logging.info("Временный файл изображения удалён.")
 
+    # Переход к этапу ввода вариантов ответов
     await state.set_state(QuizStates.waiting_for_answers)
-
-
-
 
 
 @quiz_router.message(QuizStates.waiting_for_answers)
 async def process_answers(message: types.Message, state: FSMContext):
     """
     Обработчик ввода вариантов ответов.
+
+    Проверяет количество введенных ответов и сохраняет их в состоянии.
     """
-    answers = [a.strip() for a in message.text.split(',') if a.strip()]  # Удаляем пустые ответы
-    logging.info(f"Введённые варианты ответа: {answers}")
+    answers = [a.strip() for a in message.text.split(',') if a.strip()]
+    logging.info(f"Введенные варианты ответов: {answers}")
 
     if len(answers) != 4:
-        await message.answer("Ошибка: Введите ровно 4 варианта ответа.")
+        await send_message_with_retry(bot=message.bot,
+            chat_id=message.chat.id,
+            text="Ошибка: Введите ровно 4 варианта ответа.")
+        logging.warning("Неверное количество ответов введено пользователем.")
         return
 
-    # Обновляем состояние без добавления "Я не знаю, но хочу узнать"
     await state.update_data(answers=answers)
-    await message.answer("Варианты ответа сохранены. Укажите правильный ответ.")
+    await send_message_with_retry(bot=message.bot,
+            chat_id=message.chat.id,
+            text="Варианты ответа сохранены. Укажите правильный ответ.")
     await state.set_state(QuizStates.waiting_for_correct_answer)
-
-
 
 
 @quiz_router.message(QuizStates.waiting_for_correct_answer)
 async def process_correct_answer(message: types.Message, state: FSMContext):
     """
     Обработчик ввода правильного ответа.
+
+    Проверяет наличие правильного ответа в списке вариантов и сохраняет его.
     """
     correct_answer = message.text.strip()
     data = await state.get_data()
 
     if correct_answer not in data['answers']:
-        await message.answer("Ошибка: Правильный ответ должен быть одним из введённых вариантов.")
+        await send_message_with_retry(bot=message.bot,
+            chat_id=message.chat.id,
+            text="Ошибка: Правильный ответ должен быть одним из введенных вариантов.")
+        logging.warning(f"Пользователь ввел некорректный правильный ответ: {correct_answer}")
         return
 
     await state.update_data(correct_answer=correct_answer)
-    await message.answer("Правильный ответ сохранён. Введите краткое пояснение к задачке.")
+    await send_message_with_retry(bot=message.bot,
+            chat_id=message.chat.id,
+            text="Правильный ответ сохранен. Введите краткое пояснение к задачке.")
     await state.set_state(QuizStates.waiting_for_explanation)
-
-
 
 
 @quiz_router.message(QuizStates.waiting_for_explanation)
 async def process_explanation(message: types.Message, state: FSMContext):
     """
-    Обработчик ввода пояснения к задачке.
+    Обработчик ввода пояснения к задаче.
+
+    Сохраняет пояснение и переходит к этапу ввода ссылки на ресурс.
     """
     explanation = message.text.strip()
     await state.update_data(explanation=explanation)
-    await message.answer("Пояснение сохранено. Введите ссылку на дополнительный ресурс.")
+    logging.info(f"Пояснение к задаче: {explanation}")
+    await send_message_with_retry(bot=message.bot,
+            chat_id=message.chat.id,
+            text="Пояснение сохранено. Введите ссылку на дополнительный ресурс.")
     await state.set_state(QuizStates.waiting_for_resource_link)
+
 
 
 
@@ -196,23 +263,29 @@ async def process_explanation(message: types.Message, state: FSMContext):
 async def process_resource_link(message: types.Message, state: FSMContext):
     """
     Обработчик ввода ссылки на ресурс.
+
+    Запрашивает у пользователя ссылку на ресурс, проверяет ее корректность,
+    генерирует изображение с вопросом и готовит задачу к запуску.
     """
     resource_link = message.text.strip()
 
+    # Проверяем корректность ссылки
     if not is_valid_url(resource_link):
         await message.answer("Ошибка: Введите корректную ссылку.")
         return
 
+    # Получаем данные из состояния
     data = await state.get_data()
     temp_file_path = "temp_task_image.png"
 
+    # Генерируем изображение и сохраняем во временный файл
     image = generate_console_image(data['question'], "assets/logo.png")
     image.save(temp_file_path)
     await state.update_data(resource_link=resource_link, temp_image_path=temp_file_path)
 
     quiz_text = (
         f"Тема: {data['topic']}\n"
-        f"Подтема: {data.get('subtopic', 'Без подтемы')}\n\n"  # Если подтемы нет, показываем "Без подтемы"
+        f"Подтема: {data.get('subtopic', 'Без подтемы')}\n\n"
         f"Варианты ответов:\n\n"
         f"1. {data['answers'][0]}\n"
         f"2. {data['answers'][1]}\n"
@@ -223,13 +296,18 @@ async def process_resource_link(message: types.Message, state: FSMContext):
     )
 
     try:
-        await message.answer_photo(photo=types.FSInputFile(temp_file_path), caption=quiz_text, reply_markup=get_confirmation_keyboard())
+        # Отправка изображения пользователю
+        await message.answer_photo(photo=types.FSInputFile(temp_file_path), caption=quiz_text,
+                                   reply_markup=get_confirmation_keyboard())
         logging.info("Изображение и текст отправлены с кнопками подтверждения.")
+
         await message.answer("Задача готова к подтверждению. Выберите, что делать: запустить или отменить.")
+
     except Exception as e:
         logging.error(f"Ошибка при отправке изображения: {e}")
         await message.answer(f"Ошибка при отправке изображения: {str(e)}")
 
+    # Устанавливаем состояние FSM для следующего этапа
     await state.set_state(QuizStates.confirming_quiz)
 
 
@@ -240,9 +318,19 @@ async def confirm_quiz(callback: types.CallbackQuery, state: FSMContext, session
     data = await state.get_data()
     logging.info(f"Полученные данные из состояния: {data}")
 
+    # Получаем значение языка из состояния FSM
+    language = data.get('language')  # Получаем язык из состояния
+
+    if not language:
+        logging.error("Язык не указан в данных состояния.")
+        await callback.message.answer("Ошибка: язык задачи не найден.")
+        return
+
+
     # Генерация имени для изображения
     image_name = generate_image_name(data['topic'])
     logging.info(f"Генерация имени изображения: {image_name}")
+
 
     try:
         # Загрузка изображения в S3
@@ -262,32 +350,16 @@ async def confirm_quiz(callback: types.CallbackQuery, state: FSMContext, session
     logging.info(f"Правильный ответ: {correct_answer}")
     logging.info(f"Неправильные ответы: {wrong_answers}")
 
+    short_description = data.get('short_description', '')
+    logging.info(f"Краткое описание перед сохранением: {short_description}")
+
     # Проверка наличия всех необходимых данных
     if not all([data['topic'], correct_answer, wrong_answers, data['explanation'], image_url]):
         logging.error("Не все необходимые поля заполнены")
         await callback.message.answer("Ошибка: не все необходимые данные предоставлены")
         return
 
-    # Отправляем изображение пользователю
-    try:
-        await callback.message.answer_photo(photo=image_url)
-        logging.info("Картинка отправлена пользователю.")
-    except Exception as e:
-        logging.error(f"Ошибка при отправке изображения: {e}")
-
-    # Отправляем викторину пользователю
-    try:
-        await callback.message.answer_poll(
-            question="Какой вывод верный?",
-            options=answers + ["Я не знаю, но хочу узнать"],  # Добавляем стандартный вариант
-            type="quiz",
-            correct_option_id=answers.index(correct_answer),
-            explanation=data['explanation'],
-            is_anonymous=False
-        )
-        logging.info("Викторина отправлена пользователю.")
-    except Exception as e:
-        logging.error(f"Ошибка при отправке викторины: {e}")
+    logging.info(f"Краткое описание перед сохранением: {short_description}")
 
     # Сохранение задачи в базу данных
     try:
@@ -301,11 +373,12 @@ async def confirm_quiz(callback: types.CallbackQuery, state: FSMContext, session
                 explanation=data['explanation'],
                 resource_link=data['resource_link'],
                 image_url=image_url,
-                short_description=data.get('short_description', ''),
+                short_description=short_description,  # Сохраняем краткое описание
+                language=language,  # Передаем язык задачи
                 default_language=data.get('default_language', 'ru')
             )
             session.add(new_task)
-            await session.flush()  # Чтобы получить id новой задачи
+            await session.flush()  # Чтобы получить ID новой задачи
             logging.info(f"Задача сохранена в базе данных: {new_task.id}")
 
             # Сохраняем ID задачи в состояние FSM
@@ -319,22 +392,25 @@ async def confirm_quiz(callback: types.CallbackQuery, state: FSMContext, session
         await callback.message.answer(f"Ошибка при сохранении задачи в базе данных: {str(e)}")
         return
 
-    # Не очищаем состояние здесь, чтобы сохранить task_id для следующей функции
-    logging.info(f"Состояние после сохранения задачи: {await state.get_data()}")
+    # Отправляем задачу в чат с кнопками
+    try:
+        quiz_text = (
+            f"Тема: {data['topic']}\n"
+            f"Подтема: {data.get('subtopic', 'Без подтемы')}\n"
+            f"Варианты ответов:\n"
+            f"1. {data['answers'][0]}\n"
+            f"2. {data['answers'][1]}\n"
+            f"3. {data['answers'][2]}\n"
+            f"4. {data['answers'][3]}\n"
+            f"5. Я не знаю, но хочу узнать\n\n"
+            f"Ссылка на ресурс: {data['resource_link']}"
+        )
 
-    # Предложение опубликовать задачу
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("Опубликовать в группе", callback_data="publish_to_group"))
-    await callback.message.answer("Хотите опубликовать эту задачу в группе?", reply_markup=keyboard)
-
-
-
-
-    # Появление кнопки для отправки в группу
-    await callback.message.answer("Викторина успешно запущена. Выберите действие:", reply_markup=get_publish_group_keyboard())
-
-    # # Очищаем состояние
-    # await state.clear()
+        await callback.message.answer_photo(photo=image_url, caption=quiz_text, reply_markup=get_publish_group_keyboard())
+        logging.info("Задача готова к запуску. Предлагаем опубликовать или отменить.")
+    except Exception as e:
+        logging.error(f"Ошибка при отправке задачи в чат: {e}")
+        await callback.message.answer(f"Ошибка при отправке задачи в чат: {str(e)}")
 
 
 
@@ -476,11 +552,18 @@ async def confirm_launch(callback: types.CallbackQuery, state: FSMContext):
 
 @quiz_router.callback_query(lambda query: query.data == "confirm_cancel")
 async def confirm_cancel(callback: types.CallbackQuery, state: FSMContext):
-    # Логика отмены викторины
-    await callback.message.answer("Викторина отменена.")
+    """
+    Обработчик отмены задачи.
+    """
+    data = await state.get_data()
 
-    # Замена кнопок на "Новая задача" и "JSON с задачками"
-    await callback.message.edit_reply_markup(reply_markup=get_task_or_json_keyboard())
+    # Удаление временного изображения
+    if os.path.exists(data.get('temp_image_path', '')):
+        os.remove(data['temp_image_path'])
+        logging.info("Временный файл изображения удалён после отмены.")
+
+    await callback.message.answer("Викторина отменена. Данные не были сохранены.", reply_markup=main_menu_keyboard())
+    await callback.message.edit_reply_markup()
     await state.clear()
 
 
@@ -490,7 +573,9 @@ async def confirm_cancel(callback: types.CallbackQuery, state: FSMContext):
 @quiz_router.callback_query(lambda query: query.data == "publish_to_group")
 async def publish_to_group(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
     """
-    Публикация задачи в группу после подтверждения.
+    Публикация задачи в группу.
+
+    Отправляет изображение и викторину в указанную группу и обновляет запись в базе данных.
     """
     data = await state.get_data()
     logging.info(f"Данные из состояния: {data}")
@@ -509,39 +594,63 @@ async def publish_to_group(callback: types.CallbackQuery, state: FSMContext, ses
             await callback.message.answer(f"Ошибка: задача с ID {task_id} не найдена.")
             return
 
-        logging.info(
-            f"Задача до публикации: id={task.id}, published={task.published}, publish_date={task.publish_date}")
+        # Получаем язык задачи, который был сохранен в момент создания
+        language = task.language
+        logging.info(f"Используем язык задачи для публикации: {language}")
 
-        if task.published:
-            logging.info(f"Задача с ID {task_id} уже была опубликована.")
-            await callback.message.answer("Эта задача уже была опубликована.")
+        # Проверяем, есть ли группа для данной темы и языка
+        group_query = select(Group).where(Group.topic == task.topic, Group.language == language)
+        group = await session.execute(group_query)
+        group_instance = group.scalar_one_or_none()
+
+        if not group_instance:
+            logging.warning(f"Группа для темы '{task.topic}' и языка '{language}' не найдена.")
+            await callback.message.answer(
+                f"Группа для темы '{task.topic}' и языка '{language}' не найдена.\n\n"
+                "Задача сохранена, но публикация не выполнена. Как только будет создана соответствующая группа, вы сможете опубликовать задачу."
+            )
             return
 
-        group_chat_id = int(GROUP_CHAT_ID)
-        logging.info(f"ID группы для публикации: {group_chat_id}")
 
-        # Отправляем изображение в группу
+            # Если группа найдена, логируем подробности
+        logging.info(f"Найдена группа: ID={group_instance.id}, Имя={group_instance.group_name},"
+                f" Язык={group_instance.language}")
+
+        group_chat_id = group_instance.group_id
+        group_db_id = group_instance.id
+        logging.info(f"ID группы для публикации (group_id): {group_chat_id}")
+        logging.info(f"ID группы в базе данных (id): {group_db_id}")
+
+
+        # Отправляем изображение в группу с кнопкой "Узнать подробнее"
         try:
             await callback.bot.send_photo(
                 chat_id=group_chat_id,
                 photo=task.image_url,
-                caption=f"Тема: {task.topic}\nПодтема: {task.subtopic or 'Без подтемы'}"
+                caption=f"Тема: {task.topic}\nПодтема: {task.subtopic or 'Без подтемы'}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Узнать подробнее", url=task.resource_link)]
+                ])
             )
             logging.info(f"Изображение отправлено в группу: {task.image_url}")
+        except aiogram.exceptions.TelegramRetryAfter as e:
+            logging.warning(f"Попадание в лимит Telegram: ждем {e.retry_after} секунд.")
+            await asyncio.sleep(e.retry_after)
+            return await publish_to_group(callback, state, session)  # Попробуем снова после ожидания
         except Exception as e:
             logging.error(f"Ошибка при отправке изображения в группу: {e}")
             await callback.message.answer(f"Ошибка при отправке изображения в группу: {e}")
             return
 
-        # Формирование списка вариантов ответа
+        # Перемешивание вариантов ответов
+        options = task.wrong_answers + [task.correct_answer]
+        random.shuffle(options)  # Перемешиваем список вариантов
+
+        # Определяем индекс правильного ответа в перемешанном списке
+        correct_option_id = options.index(task.correct_answer)
+
+        # Отправляем опрос в группу
         try:
-            options = task.wrong_answers + [task.correct_answer]  # Добавляем правильный ответ к неверным
-            logging.info(f"Варианты ответа: {options}")
-
-            # Получение индекса правильного ответа
-            correct_option_id = options.index(task.correct_answer)
-
-            # Отправляем викторину в группу
             await callback.bot.send_poll(
                 chat_id=group_chat_id,
                 question=task.question,
@@ -551,64 +660,89 @@ async def publish_to_group(callback: types.CallbackQuery, state: FSMContext, ses
                 explanation=task.explanation,
                 is_anonymous=False
             )
-            logging.info(f"Викторина отправлена: {task.question}")
-        except ValueError as e:
-            logging.error(f"Ошибка при отправке викторины: {e}")
-            await callback.message.answer(f"Ошибка при отправке викторины: {e}")
-            return
+            logging.info(f"Опрос отправлен в группу: {task.question}")
+
+        except aiogram.exceptions.TelegramRetryAfter as e:
+            logging.warning(f"Попадание в лимит Telegram: ждем {e.retry_after} секунд.")
+            await asyncio.sleep(e.retry_after)
+            return await publish_to_group(callback, state, session)  # Повтор после ожидания
         except Exception as e:
-            logging.error(f"Ошибка при отправке викторины в группу: {e}")
-            await callback.message.answer(f"Ошибка при отправке викторины в группу: {e}")
+            logging.error(f"Ошибка при отправке опроса: {e}")
+            await callback.message.answer(f"Ошибка при отправке опроса: {e}")
             return
 
-        # Лог перед началом запроса к базе данных
-        logging.info(f"Поиск группы с group_id: {group_chat_id} в базе данных.")
-        # Находим группу
-        group = await session.execute(select(Group).where(Group.group_id == group_chat_id))
-        group_instance = group.scalar_one_or_none()
-        logging.info(f"Результат запроса группы: {group_instance}")
-
-        if group_instance is None:
-            logging.error(f"Группа с group_id {group_chat_id} не найдена в базе данных.")
-            await callback.message.answer(f"Ошибка: Группа с ID {group_chat_id} не найдена в базе данных.")
-            return
-
-        # Обновляем задачу
+        # Обновляем информацию о задаче в базе данных
         current_time = datetime.utcnow()
+        logging.info(f"Обновление задачи: установка group_id = {group_db_id}")
+
         stmt = (
             update(Task)
             .where(Task.id == task_id)
             .values(
                 published=True,
                 publish_date=current_time,
-                group_id=group_instance.id
+                group_id=group_db_id  # Используем ID записи группы из таблицы groups
             )
         )
         await session.execute(stmt)
-
-        # Лог перед коммитом изменений в базе данных
-        logging.info(f"Обновление задачи в базе данных: {task_id}")
-        # Выполняем коммит
+        await session.flush()
         await session.commit()
-        logging.info("Коммит выполнен успешно")
 
-        # Проверяем, что изменения действительно сохранились
-        updated_task = await session.get(Task, task_id)
-        logging.info(
-            f"Задача после обновления: id={updated_task.id}, published={updated_task.published}, publish_date={updated_task.publish_date}, group_id={updated_task.group_id}")
-
-        if updated_task.published and updated_task.publish_date and updated_task.group_id == group_instance.id:
-            await callback.message.answer(f"Задача успешно опубликована в группе.")
-            logging.info(f"Задача с ID {task_id} успешно опубликована и обновлена в базе данных.")
-        else:
-            logging.error(f"Обновление задачи не удалось. Текущее состояние: {updated_task}")
-            await callback.message.answer("Произошла ошибка при публикации задачи. Пожалуйста, попробуйте еще раз.")
+        logging.info(f"Задача с ID {task_id} успешно обновлена в базе данных и опубликована в группе.")
+        await callback.message.answer("Задача успешно опубликована в группе.")
 
     except Exception as e:
         logging.error(f"Ошибка при публикации задачи: {e}")
         await callback.message.answer(f"Произошла ошибка при публикации задачи: {str(e)}")
         await session.rollback()
         logging.info("Выполнен откат изменений")
+
     finally:
         await state.clear()
         logging.info("Состояние очищено.")
+
+
+
+
+async def publish_task_to_group(callback, task, group_chat_id, session):
+    try:
+        # Отправляем изображение в группу
+        await callback.bot.send_photo(
+            chat_id=group_chat_id,
+            photo=task.image_url,
+            caption=f"Тема: {task.topic}\nПодтема: {task.subtopic or 'Без подтемы'}"
+        )
+        logging.info(f"Изображение отправлено в группу: {task.image_url}")
+
+        # Отправляем викторину
+        options = task.wrong_answers + [task.correct_answer]  # Добавляем правильный ответ к неверным
+        await callback.bot.send_poll(
+            chat_id=group_chat_id,
+            question=task.question,
+            options=options,
+            type="quiz",
+            correct_option_id=options.index(task.correct_answer),
+            explanation=task.explanation,
+            is_anonymous=False
+        )
+        logging.info(f"Викторина отправлена: {task.question}")
+
+        # Обновление информации о задаче в базе данных
+        current_time = datetime.utcnow()
+        stmt = (
+            update(Task)
+            .where(Task.id == task.id)
+            .values(
+                published=True,
+                publish_date=current_time,
+                group_id=group_chat_id
+            )
+        )
+        await session.execute(stmt)
+        await session.commit()
+        logging.info(f"Задача с ID {task.id} успешно опубликована и обновлена в базе данных.")
+
+        await callback.message.answer(f"Задача успешно опубликована в группе.")
+    except Exception as e:
+        logging.error(f"Ошибка при публикации задачи в группу: {e}")
+        await callback.message.answer(f"Ошибка при публикации задачи в группу: {str(e)}")
