@@ -13,6 +13,7 @@ class QuizStates(StatesGroup):
     waiting_for_correct_answer = State()  # Ожидание указания правильного ответа
     waiting_for_explanation = State()  # Ожидание ввода пояснения
     waiting_for_resource_link = State()  # Ожидание ссылки на ресурс
+    waiting_for_task_id = State()  # Ожидание публикации задачи по ID
     waiting_for_file = State()  # Ожидание загрузки файла с задачами (новое состояние)
     waiting_for_post_time = State()
     waiting_for_subtopic = State()

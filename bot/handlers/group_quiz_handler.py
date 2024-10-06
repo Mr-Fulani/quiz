@@ -5,12 +5,19 @@ import random
 from zoneinfo import ZoneInfo
 
 import aiogram
-from aiogram import Router, types
 from aiogram.filters import Command
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from database.models import Task, Group
 from config import GROUP_CHAT_ID
+
+from aiogram import Router, types, F
+from aiogram.fsm.context import FSMContext
+from bot.states import QuizStates
+
+
+
+router = Router()
 
 
 # Создаем роутер
@@ -25,6 +32,15 @@ logging.basicConfig(
 
 # Пример лога для теста
 logging.info("Запущена публикация задач в группы.")
+
+
+
+''' проверка работы роутера '''
+@group_publisher_router.message()
+async def handle_all_messages(message: types.Message):
+    logging.info(f"[group_quiz_handler] Получено сообщение: {message.text}")
+
+
 
 
 async def fetch_tasks(session: AsyncSession):
@@ -216,6 +232,8 @@ async def publish_task(message: types.Message, task: Task, session: AsyncSession
         logging.error(f"Ошибка при публикации задачи: {e}")
 
 
+
+
 async def update_task_in_db(session: AsyncSession, task: Task, group_db_id):
     """
     Обновляет поля задачи в базе данных.
@@ -223,7 +241,7 @@ async def update_task_in_db(session: AsyncSession, task: Task, group_db_id):
     try:
         # Устанавливаем необходимые поля
         task.published = True
-        task.publish_date = datetime.now(timezone.utc).replace(tzinfo=None)
+        task.publish_date = datetime.datetime.utcnow()  # Используем наивное время
         task.group_id = group_db_id  # Используем внутренний ID группы в базе данных
 
         # Добавляем объект `task` в сессию, чтобы убедиться, что он отслеживается
@@ -273,16 +291,30 @@ async def publish_tasks_in_group(message: types.Message, session: AsyncSession):
 
 
 
-@group_publisher_router.message(Command("publish_task"))
-async def publish_task_by_id(message: types.Message, session: AsyncSession):
+
+
+
+
+
+@group_publisher_router.message(F.text == "Опубликовать по ID")
+async def ask_for_task_id(message: types.Message, state: FSMContext):
+    logging.info(f"Получено сообщение: {message.text}")
+    logging.info(f"Состояние: {await state.get_state()}")
+    logging.info("Обработчик 'Опубликовать по ID' вызван.")
+    await message.answer("Пожалуйста, введите ID задачи для публикации:")
+    await state.set_state(QuizStates.waiting_for_task_id)
+
+
+
+@router.message(QuizStates.waiting_for_task_id)
+async def publish_task_by_id(message: types.Message, state: FSMContext, session: AsyncSession):
     """
-    Публикует конкретную задачу по её ID.
+    Публикует конкретную задачу по введенному ID.
     """
     try:
-        task_id = int(message.text.split()[1])  # Получаем ID задачи из сообщения
-    except (IndexError, ValueError):
-        await message.answer("Пожалуйста, укажите корректный ID задачи. Пример: /publish_task 1")
-        logging.warning("Некорректный ID задачи: %s", message.text)
+        task_id = int(message.text.strip())  # Получаем ID задачи из сообщения
+    except ValueError:
+        await message.answer("Пожалуйста, укажите корректный ID задачи. Пример: 1")
         return
 
     # Получаем задачу из базы данных
@@ -295,40 +327,55 @@ async def publish_task_by_id(message: types.Message, session: AsyncSession):
 
     if not task:
         await message.answer(f"Задача с ID {task_id} не найдена.")
-        logging.info(f"Задача с ID {task_id} не найдена.")
         return
 
     # Публикуем задачу
     try:
         await publish_task(message, task, session)
+        await message.answer(f"Задача с ID {task_id} успешно опубликована.")
     except Exception as e:
         logging.exception(f"Ошибка при публикации задачи с ID {task_id}: {e}")
         await message.answer(f"Ошибка при публикации задачи с ID {task_id}.")
         return
 
-    # # Обновляем поля задачи в базе данных
-    # try:
-    #     task.published = True
-    #     task.publish_date = datetime.utcnow()
-    #
-    #     # Получаем идентификатор группы
-    #     group_chat_id = int(GROUP_CHAT_ID)
-    #     group_instance = await session.execute(select(Group).where(Group.group_id == group_chat_id))
-    #     group_instance = group_instance.scalar_one_or_none()
-    #
-    #     if group_instance:
-    #         task.group_id = group_instance.group_id
-    #         await session.commit()
-    #         logging.info(f"Задача с ID {task_id} успешно обновлена в базе данных. Группа ID: {group_chat_id}")
-    #     else:
-    #         logging.error(f"Группа с ID {group_chat_id} не найдена в базе данных.")
-    #         await message.answer(f"Ошибка: Группа с ID {group_chat_id} не найдена в базе данных.")
-    #         return
-    #
-    # except Exception as e:
-    #     logging.exception(f"Ошибка при обновлении задачи с ID {task_id} в базе данных: {e}")
-    #     await message.answer(f"Ошибка при обновлении задачи в базе данных: {e}")
-    #     return
-    #
-    # await message.answer(f"Задача с ID {task_id} успешно опубликована.")
-    # logging.info(f"Задача с ID {task_id} успешно опубликована.")
+
+
+
+
+
+
+
+
+# @group_publisher_router.message(Command("publish_task"))
+# async def publish_task_by_id(message: types.Message, session: AsyncSession):
+#     """
+#     Публикует конкретную задачу по её ID.
+#     """
+#     try:
+#         task_id = int(message.text.split()[1])  # Получаем ID задачи из сообщения
+#     except (IndexError, ValueError):
+#         await message.answer("Пожалуйста, укажите корректный ID задачи. Пример: /publish_task 1")
+#         logging.warning("Некорректный ID задачи: %s", message.text)
+#         return
+#
+#     # Получаем задачу из базы данных
+#     try:
+#         task = await fetch_task_by_id(session, task_id)
+#     except Exception as e:
+#         logging.exception(f"Ошибка при получении задачи с ID {task_id}: {e}")
+#         await message.answer(f"Ошибка при получении задачи с ID {task_id}.")
+#         return
+#
+#     if not task:
+#         await message.answer(f"Задача с ID {task_id} не найдена.")
+#         logging.info(f"Задача с ID {task_id} не найдена.")
+#         return
+#
+#     # Публикуем задачу
+#     try:
+#         await publish_task(message, task, session)
+#     except Exception as e:
+#         logging.exception(f"Ошибка при публикации задачи с ID {task_id}: {e}")
+#         await message.answer(f"Ошибка при публикации задачи с ID {task_id}.")
+#         return
+

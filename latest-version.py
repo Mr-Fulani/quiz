@@ -12,7 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.services.image_service import generate_console_image, generate_image_name
 from bot.services.s3_service import upload_to_s3
 from bot.services.text_service import is_valid_url
-from bot.keyboards.inline import get_confirmation_keyboard, get_task_or_json_keyboard, topic_keyboard
+from bot.keyboards.inline import get_confirmation_keyboard, get_task_or_json_keyboard, topic_keyboard, \
+    main_menu_keyboard
 from bot.states import QuizStates
 from database.models import Task
 
@@ -329,15 +330,20 @@ async def cancel_quiz(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
 
 
-
-
-
-
 @quiz_router.callback_query(lambda query: query.data == "new_task")
 async def start_new_quiz(callback: types.CallbackQuery, state: FSMContext):
     logging.info("Кнопка 'Новая задача' была нажата.")
-    await callback.message.answer("Выберите тему для новой задачи:", reply_markup=topic_keyboard())
+    await callback.message.answer(
+        "Выберите тему для новой задачи:",
+        reply_markup=topic_keyboard()
+    )
     await state.set_state(QuizStates.waiting_for_topic)
+
+    # Возврат к главному меню после завершения действия
+    await callback.message.answer(
+        "Возвращаемся в главное меню...",
+        reply_markup=main_menu_keyboard()
+    )
 
 
 

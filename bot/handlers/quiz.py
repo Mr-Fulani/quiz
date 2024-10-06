@@ -9,18 +9,18 @@ import aiogram
 from PIL import Image
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.keyboards.inline import topic_keyboard, get_confirmation_keyboard, get_publish_group_keyboard, \
+    get_task_or_json_keyboard
+from bot.keyboards.reply import main_menu_keyboard
 from bot.services.image_service import generate_console_image, generate_image_name
 from bot.services.s3_service import upload_to_s3
 from bot.services.text_service import is_valid_url
 from bot.services.message_service import send_message_with_retry, send_photo_with_retry  # Добавлено для обработки ожидания
-from bot.keyboards.inline import (
-    get_confirmation_keyboard, get_task_or_json_keyboard, topic_keyboard,
-    get_publish_group_keyboard, main_menu_keyboard
-)
 from bot.states import QuizStates
 from config import GROUP_CHAT_ID
 from database.models import Task, Group
@@ -29,31 +29,39 @@ from datetime import datetime
 
 quiz_router = Router()
 
+# Создаем роутер
+router = Router()
+
 # Инициализация логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-@quiz_router.callback_query(lambda query: query.data.startswith("topic_"))
-async def choose_topic(callback: types.CallbackQuery, state: FSMContext):
-    """
-    Обработчик выбора темы викторины.
 
-    Сохраняет выбранную тему в состояние и запрашивает подтему у пользователя.
-    """
-    topic = callback.data.split("_")[1]
-    logging.info(f"Тема выбрана: {topic}")
-
-    await state.update_data(topic=topic)
-
-    # Отправляем сообщение с предложением ввести подтему
-    await send_message_with_retry(
-        bot=callback.bot,
-        chat_id=callback.message.chat.id,
-        text=f"Вы выбрали тему: {topic}. Введите подтему (например, 'Списки') или введите '0' для пропуска."
+# Обработчик нажатия на кнопку "Создать задачу"
+@router.message(F.text == "Создать задачу")
+async def create_task(message: Message):
+    await message.answer(
+        "Выберите тему для задачи:",
+        reply_markup=topic_keyboard()
     )
 
-    # Устанавливаем состояние ожидания подтемы
+
+
+
+# Хэндлер для обработки выбора темы
+@router.callback_query(F.data.startswith("topic_"))
+async def choose_topic(callback_query: types.CallbackQuery, state: FSMContext):
+    topic = callback_query.data.split("_")[1]
+    await state.update_data(topic=topic)
+
+    await callback_query.message.answer(
+        f"Вы выбрали тему: {topic}. Введите подтему или введите '0' для пропуска."
+    )
     await state.set_state(QuizStates.waiting_for_subtopic)
+
+    # Удаление клавиатуры после нажатия кнопки
+    await callback_query.answer()
+    await callback_query.message.edit_reply_markup()
 
 
 
@@ -124,6 +132,8 @@ async def process_short_description(message: types.Message, state: FSMContext):
     await state.set_state(QuizStates.waiting_for_language)
 
 
+
+
 @quiz_router.message(QuizStates.waiting_for_language)
 async def process_language(message: types.Message, state: FSMContext):
     """
@@ -148,6 +158,8 @@ async def process_language(message: types.Message, state: FSMContext):
 
     # Переход к этапу ввода вопроса
     await state.set_state(QuizStates.waiting_for_question)
+
+
 
 
 @quiz_router.message(QuizStates.waiting_for_question)
@@ -191,6 +203,8 @@ async def process_question(message: types.Message, state: FSMContext):
     await state.set_state(QuizStates.waiting_for_answers)
 
 
+
+
 @quiz_router.message(QuizStates.waiting_for_answers)
 async def process_answers(message: types.Message, state: FSMContext):
     """
@@ -215,6 +229,8 @@ async def process_answers(message: types.Message, state: FSMContext):
     await state.set_state(QuizStates.waiting_for_correct_answer)
 
 
+
+
 @quiz_router.message(QuizStates.waiting_for_correct_answer)
 async def process_correct_answer(message: types.Message, state: FSMContext):
     """
@@ -237,6 +253,8 @@ async def process_correct_answer(message: types.Message, state: FSMContext):
             chat_id=message.chat.id,
             text="Правильный ответ сохранен. Введите краткое пояснение к задачке.")
     await state.set_state(QuizStates.waiting_for_explanation)
+
+
 
 
 @quiz_router.message(QuizStates.waiting_for_explanation)
@@ -385,7 +403,11 @@ async def confirm_quiz(callback: types.CallbackQuery, state: FSMContext, session
             await state.update_data(task_id=new_task.id)
 
         # Подтверждение сохранения
-        await callback.message.answer(f"Задача успешно сохранена с ID: {new_task.id}")
+        await callback.message.answer(
+            "Задача успешно сохранена с ID: {new_task.id}",
+            reply_markup=get_publish_group_keyboard()
+        )
+        logging.info(f"Отправлено сообщение с клавиатурой для публикации задачи: get_publish_group_keyboard()")
 
     except Exception as e:
         logging.error(f"Ошибка при сохранении задачи в базе данных: {e}")
@@ -428,14 +450,14 @@ async def cancel_quiz(callback: types.CallbackQuery, state: FSMContext):
         logging.info("Временный файл изображения удалён после отмены.")
 
     await callback.message.answer("Викторина отменена. Данные не были сохранены.")
-    await callback.message.edit_reply_markup(reply_markup=get_task_or_json_keyboard())
+    await callback.message.edit_reply_markup()
     await state.clear()
 
 
 
 
 
-
+''' ??? '''
 @quiz_router.callback_query(lambda query: query.data == "new_task")
 async def start_new_quiz(callback: types.CallbackQuery, state: FSMContext):
     logging.info("Кнопка 'Новая задача' была нажата.")
@@ -445,15 +467,27 @@ async def start_new_quiz(callback: types.CallbackQuery, state: FSMContext):
 
 
 
-@quiz_router.callback_query(lambda query: query.data == "upload_json")
-async def upload_tasks_via_json(callback: types.CallbackQuery, state: FSMContext):
+
+
+# @quiz_router.callback_query(lambda query: query.data == "upload_json")
+# async def upload_tasks_via_json(callback: types.CallbackQuery, state: FSMContext):
+#     """
+#     Обработчик для загрузки задач из JSON файла.
+#     """
+#     await callback.message.answer("Пожалуйста, загрузите JSON файл с задачами.")
+#     await state.set_state(QuizStates.waiting_for_file)
+#     logging.info("Переход в состояние ожидания файла JSON.")
+
+
+
+@router.message(F.text == "Загрузить JSON")
+async def upload_tasks_via_json(message: Message, state: FSMContext):
     """
     Обработчик для загрузки задач из JSON файла.
     """
-    await callback.message.answer("Пожалуйста, загрузите JSON файл с задачами.")
-    await state.set_state(QuizStates.waiting_for_file)
+    await message.answer("Пожалуйста, загрузите JSON файл с задачами.")
+    await state.set_state(QuizStates.waiting_for_file)  # Устанавливаем состояние ожидания файла
     logging.info("Переход в состояние ожидания файла JSON.")
-
 
 
 
@@ -562,7 +596,10 @@ async def confirm_cancel(callback: types.CallbackQuery, state: FSMContext):
         os.remove(data['temp_image_path'])
         logging.info("Временный файл изображения удалён после отмены.")
 
-    await callback.message.answer("Викторина отменена. Данные не были сохранены.", reply_markup=main_menu_keyboard())
+    await callback.message.answer(
+        "Викторина отменена. Данные не были сохранены.",
+        reply_markup=main_menu_keyboard()  # Отображаем главное меню
+    )
     await callback.message.edit_reply_markup()
     await state.clear()
 
